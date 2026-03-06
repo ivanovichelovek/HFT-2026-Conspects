@@ -20,6 +20,7 @@
 - [Обработка и прием на 2 ядрах](#обработка)
 - [Системные концепции](#системные-концепции)
 - [Аргументы `rte_eal_init()`](#аргументы-rte_eal_init-eal-parameters)
+- [Базовый CMake](#cmake)
 
 ---
 ## Словарик
@@ -30,6 +31,7 @@
 |---|---|---|
 | **DPDK** | Data Plane Development Kit | Фреймворк Intel для быстрой обработки пакетов в сетевых приложениях |
 | **NIC** | Network Interface Card | Сетевая карта — физическое устройство приёма/передачи пакетов |
+| **RTE** | Run Time Environment | Среда времени выполнения |
 | **[EAL](#eal-environment-abstraction-layer)** | Environment Abstraction Layer | Базовый слой DPDK: инициализация hugepages, ядер CPU, драйверов |
 | **[PCI](#pcipcie-и-dma-как-пакет-попадает-в-ram)** | Peripheral Component Interconnect | Шина для подключения устройств (NIC, GPU и др.) к материнской плате |
 | **[RX](#rx-queue-receive-queue)** | Receive | Приём пакетов (входящий трафик) |
@@ -1436,3 +1438,337 @@ while (!exit_indicator) {
 --trace-mode=discard     # отбрасывать новые данные, когда файл заполнен
 ```
 ---
+
+## CMAKE
+
+> Этот раздел объясняет, что происходит при сборке проекта с CMake,
+> и что означают `RTE_SDK`, `RTE_TARGET` и другие параметры.
+
+---
+
+### Что такое target_compile_definitions (CMake)
+
+`target_compile_definitions` — команда CMake, которая передаёт **макросы препроцессора** (`#define`) компилятору при сборке конкретной цели.
+
+```cmake
+target_compile_definitions(run PRIVATE
+    RTE_SDK=/usr/local/
+    RTE_TARGET=x86_64-default-linuxapp-gcc
+)
+```
+
+Это эквивалентно тому, что компилятор вызывается с флагами:
+
+```bash
+g++ -DRTE_SDK=/usr/local/ -DRTE_TARGET=x86_64-default-linuxapp-gcc ...
+```
+
+---
+
+### Ключевое слово PRIVATE
+
+В CMake у `target_compile_definitions` (и других `target_*` команд) есть три области видимости:
+
+| Ключевое слово | Где применяется определение |
+|---|---|
+| `PRIVATE` | Только при компиляции самой цели (`run`) |
+| `PUBLIC` | При компиляции цели И всего, что от неё зависит |
+| `INTERFACE` | Только для зависимостей, не для самой цели |
+
+В нашем случае `PRIVATE` означает: `RTE_SDK` и `RTE_TARGET` — только для цели `run`.
+Другие цели CMake в том же проекте этих определений не получат.
+
+---
+
+### RTE_SDK — путь к установленному DPDK
+
+```cmake
+RTE_SDK=/usr/local/
+```
+
+**Что это:** абсолютный путь к директории, где установлен DPDK (его заголовочные файлы, библиотеки, утилиты).
+
+При установке DPDK через `meson install` файлы раскладываются так:
+
+```
+/usr/local/
+  ├── include/
+  │   └── rte_eal.h, rte_ethdev.h, rte_mbuf.h, ...   ← заголовки
+  ├── lib/
+  │   └── librte_eal.so, librte_ethdev.so, ...         ← библиотеки
+  └── bin/
+      └── dpdk-devbind.py, dpdk-proc-info, ...         ← утилиты
+```
+
+---
+
+### RTE_TARGET — строка описания целевой платформы
+
+```cmake
+RTE_TARGET=x86_64-default-linuxapp-gcc
+```
+
+**Что это:** строка в формате `<arch>-<machine>-<execenv>-<toolchain>`, которая однозначно описывает платформу, для которой собирается код.
+
+Разбор по частям:
+
+```
+x86_64  -  default  -  linuxapp  -  gcc
+  │           │            │          │
+  │           │            │          └─ toolchain: компилятор
+  │           │            │             gcc  = GNU Compiler Collection
+  │           │            │             clang = LLVM/Clang
+  │           │            │
+  │           │            └─ execution environment (execenv): среда выполнения
+  │           │               linuxapp = Linux userspace приложение
+  │           │               bsdapp   = FreeBSD userspace приложение
+  │           │               linuxapp + DPDK = kernel bypass в Linux
+  │           │
+  │           └─ machine: тип машины/микроархитектура
+  │              native  = оптимизировать под текущий CPU (SSE, AVX, ...)
+  │              default = базовые оптимизации, совместимые с любым x86_64
+  │              wsm     = Westmere (конкретное поколение Intel)
+  │              ivb     = Ivy Bridge
+  │              hsw     = Haswell
+  │
+  └─ arch: архитектура процессора
+     x86_64  = 64-bit x86 (Intel/AMD)
+     arm64   = 64-bit ARM
+     ppc_64  = 64-bit PowerPC
+```
+---
+
+### Остальные CMAKE переменные
+
+> Разбор файла сборки `CMakeLists.txt`.
+
+---
+
+### Полный файл
+
+```cmake
+cmake_minimum_required(VERSION 3.28)
+
+project(HFT VERSION 25.09.08 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+set(Boost_USE_STATIC_LIBS    ON)
+set(Boost_USE_STATIC_RUNTIME ON)
+
+find_package(Boost 1.85 REQUIRED COMPONENTS log)
+
+include_directories(${Boost_INCLUDE_DIRS})
+
+add_executable             (run source/main.cpp)
+target_compile_options     (run PRIVATE -Wall -Wextra -Wpedantic -O3)
+target_compile_definitions (run PRIVATE RTE_SDK=/usr/local/ RTE_TARGET=x86_64-default-linuxapp-gcc)
+target_link_libraries      (run PRIVATE ${Boost_LIBRARIES})
+target_link_libraries      (run PRIVATE -lrte_eal -lrte_ethdev -lrte_mbuf -lrte_mempool)
+```
+
+---
+
+### cmake_minimum_required(VERSION 3.28)
+
+Задаёт минимальную версию CMake, с которой проект гарантированно работает.
+
+```cmake
+cmake_minimum_required(VERSION 3.28)
+```
+
+- Если на машине установлен CMake старше версии 3.28 — сборка сразу упадёт с ошибкой.
+- Версия 3.28 вышла в 2023 году. Она нужна здесь, так как проект использует C++23 (`CMAKE_CXX_STANDARD 23`) и современные target-команды.
+
+
+---
+
+### project(HFT VERSION 25.09.08 LANGUAGES CXX)
+
+Объявляет проект: его имя, версию и используемые языки.
+
+```cmake
+project(HFT VERSION 25.09.08 LANGUAGES CXX)
+```
+
+| Поле | Значение | Смысл |
+|---|---|---|
+| `HFT` | имя проекта | High-Frequency Trading — название проекта |
+| `VERSION 25.09.08` | версия | год.месяц.день — дата-версия в стиле CalVer |
+| `LANGUAGES CXX` | язык | только C++ (если не указать — CMake ищет C и C++ по умолчанию) |
+
+---
+
+### set(CMAKE_CXX_STANDARD 23) / set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+```cmake
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+```
+
+- `CMAKE_CXX_STANDARD 23` — компилировать всё с `-std=c++23`.
+- `CMAKE_CXX_STANDARD_REQUIRED True` — если компилятор не поддерживает C++23, сборка **упадёт с ошибкой**, вместо отката к более старому стандарту.
+
+---
+
+### set(Boost_USE_STATIC_LIBS ON) / set(Boost_USE_STATIC_RUNTIME ON)
+
+```cmake
+set(Boost_USE_STATIC_LIBS    ON)
+set(Boost_USE_STATIC_RUNTIME ON)
+```
+
+Говорит `find_package(Boost)`, что нужны **статические** библиотеки Boost.
+
+**Статическая линковка** означает: код Boost вшивается прямо в исполняемый файл `run` при сборке. Итоговый бинарник не зависит от того, установлен ли Boost на целевой машине.
+
+**Динамическая линковка** (если оба `OFF`): исполняемый файл маленький, но на машине должны быть `libboost_log.so.1.85.0` и другие `.so`. Если их нет — программа не запустится.
+
+| | Статическая (ON) | Динамическая (OFF) |
+|---|---|---|
+| Размер бинарника | Больше | Меньше |
+| Зависимость от Boost на целевой машине | Нет | Да |
+| Удобство для деплоя | Проще (один файл) | Требует установки Boost |
+
+`Boost_USE_STATIC_RUNTIME` — дополнительно линковать и стандартную библиотеку C++ статически (`libstdc++`, `libgcc`). Актуально для переноса бинарника между дистрибутивами Linux с разными версиями glibc.
+
+---
+
+### find_package(Boost 1.85 REQUIRED COMPONENTS log)
+
+CMake ищет установленный Boost версии >= 1.85 и компонент `log` (другие компоненты не ищет).
+
+Компонент `log` — это Boost.Log, который использует `Logger`-класс.
+
+После этой команды CMake создаёт переменные:
+- `${Boost_INCLUDE_DIRS}` — путь к заголовкам Boost (`/usr/include` и т.п.)
+- `${Boost_LIBRARIES}` — список `.a`-библиотек для линковки (`libboost_log.a`, `libboost_thread.a`, ...)
+
+---
+
+### include_directories(${Boost_INCLUDE_DIRS})
+
+```cmake
+include_directories(${Boost_INCLUDE_DIRS})
+```
+
+Добавляет директорию с заголовками Boost в пути поиска `#include` для **всего проекта**.
+
+```cpp
+// Благодаря этому работает:
+#include <boost/log/core.hpp>
+```
+
+Без этой строки компилятор не найдёт заголовки Boost и выдаст ошибку `fatal error: boost/log/core.hpp: No such file or directory`.
+
+---
+
+### add_executable(run source/main.cpp)
+
+```cmake
+add_executable(run source/main.cpp)
+```
+
+Объявляет цель сборки `run` из файла `source/main.cpp`.
+
+- `run` — имя исполняемого файла, который получится после сборки.
+- `source/main.cpp` — путь к исходнику относительно `CMakeLists.txt`.
+
+После `cmake --build .` появится файл `./run` (или `./run.exe` на Windows).
+
+---
+
+### target_compile_options(run PRIVATE -Wall -Wextra -Wpedantic -O3)
+
+```cmake
+target_compile_options(run PRIVATE -Wall -Wextra -Wpedantic -O3)
+```
+
+Флаги компилятора GCC/Clang для цели `run`:
+
+| Флаг | Смысл |
+|---|---|
+| `-Wall` | Включить все "обычные" предупреждения компилятора |
+| `-Wextra` | Включить дополнительные предупреждения (сверх `-Wall`) |
+| `-Wpedantic` | Строго следовать стандарту C++23, предупреждать о расширениях GCC |
+| `-O3` | Максимальная оптимизация кода по скорости |
+
+
+Уровни оптимизации для справки:
+
+| Флаг | Смысл |
+|---|---|
+| `-O0` | Без оптимизаций (быстрая сборка, удобно для отладки с gdb) |
+| `-O1` | Базовые оптимизации |
+| `-O2` | Хороший баланс скорость/размер (стандартный production) |
+| `-O3` | Агрессивные оптимизации: инлайнинг, векторизация, развёртка циклов |
+| `-Os` | Оптимизация под минимальный размер бинарника |
+
+---
+
+### target_link_libraries — Boost
+
+```cmake
+target_link_libraries(run PRIVATE ${Boost_LIBRARIES})
+```
+
+Линкует Boost-библиотеки (`.a` файлы, так как выбрана статическая линковка) к исполняемому файлу `run`.
+
+`${Boost_LIBRARIES}` раскрывается примерно так:
+
+```
+/usr/lib/x86_64-linux-gnu/libboost_log.a
+/usr/lib/x86_64-linux-gnu/libboost_log_setup.a
+/usr/lib/x86_64-linux-gnu/libboost_thread.a
+/usr/lib/x86_64-linux-gnu/libboost_filesystem.a
+...
+```
+
+---
+
+### target_link_libraries — DPDK
+
+```cmake
+target_link_libraries(run PRIVATE -lrte_eal -lrte_ethdev -lrte_mbuf -lrte_mempool)
+```
+Линкует библиотеки DPDK. 
+
+---
+
+### Общая схема зависимостей при сборке
+
+```
+source/main.cpp
+      │
+      ▼ компиляция (g++ -std=c++23 -Wall -Wextra -Wpedantic -O3
+      │              -DRTE_SDK=/usr/local/ -DRTE_TARGET=x86_64-default-linuxapp-gcc
+      │              -I/usr/include/boost ...)
+      │
+    main.o
+      │
+      ▼ линковка
+      ├── ${Boost_LIBRARIES}    (libboost_log.a, ...)     — статически
+      └── -lrte_eal -lrte_ethdev -lrte_mbuf -lrte_mempool — динамически (или статически)
+      │
+      ▼
+    ./run  (исполняемый файл)
+```
+
+---
+
+### Как собрать проект
+
+```bash
+# 1. Создать директорию для сборки
+mkdir build && cd build
+
+# 2. Сконфигурировать проект
+cmake ..
+
+# 3. Собрать
+cmake --build .
+
+# 4. Запустить 
+sudo ./run --lcores=0 -n 4 --
+```

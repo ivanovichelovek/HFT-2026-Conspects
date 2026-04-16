@@ -1,1 +1,0 @@
-sudo ip netns exec ns_c ./client.exe 10.200.1.1 10.200.1.2 3333

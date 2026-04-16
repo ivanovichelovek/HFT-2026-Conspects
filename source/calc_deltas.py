@@ -1,8 +1,9 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy import stats
 
-FILE_NAME_RAW = "recv_single_raw"
-FILE_NAME_BOOST = "recv_single_boost"
+FILE_NAME_RAW = "recv_duo_raw"
+FILE_NAME_BOOST = "recv_duo_boost"
 
 def calc_deltas(FILE_NAME):
   send_time = []
@@ -14,7 +15,25 @@ def calc_deltas(FILE_NAME):
 
   with open(f"{FILE_NAME}.txt", "r") as input_file:
     for row in input_file:
-      delays.append(int(row))
+      if int(row) < 100_000:
+        delays.append(int(row))
+
+  # with open(f"{FILE_NAME}.txt", "r") as input_file:
+  #   for line in input_file:
+  #     send, receive = map(int, line.split())
+  #     if send > 0 and receive > 0:
+  #       send_time.append(send)
+  #       receive_time.append(receive)
+
+  # delays = []
+
+  # for i in range(len(send_time)):
+  #   delta = receive_time[i] - send_time[i]
+  #   if delta < OUTGOING_POINT_THRESHOLD:
+  #     delays.append(receive_time[i] - send_time[i])
+
+  # delays.sort()
+  # print(delays[:100])
 
   plt.figure(figsize=(10, 5))
   plt.plot(range(len(delays)), delays, marker='o', linestyle='-', markersize=3)

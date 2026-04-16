@@ -31,7 +31,7 @@ constexpr int INCOMING_PACKET_HEADER_LEN = IPV4_HEADER_LEN + TCP_BASE_HEADER_LEN
 constexpr int INCOMING_FLAGS_OFFSET = IPV4_HEADER_LEN + 13;
 constexpr int INCOMING_PAYLOAD_OFFSET = INCOMING_PACKET_HEADER_LEN;
 constexpr int MAX_OUTGOING_PAYLOAD_LEN = DATAGRAM_LEN - OUTGOING_PACKET_HEADER_LEN;
-constexpr int MESSAGE_COUNT = 1000;
+constexpr int MESSAGE_COUNT = 10000;
 
 static_assert(sizeof(iphdr) == 20, "Unexpected IPv4 header length");
 static_assert(sizeof(tcphdr) == 20, "Unexpected TCP header length");
@@ -125,6 +125,7 @@ void initialize_base_packet(prepared_packet* packet, const sockaddr_in* src,
 
   memcpy(packet_pseudo_tcp_segment(packet), tcph, OUTGOING_TCP_HEADER_LEN);
 
+  // iph->check = checksum(packet->datagram.data(), iph->tot_len);
   iph->check = checksum(packet->datagram.data(), IPV4_HEADER_LEN);
 }
 
@@ -138,12 +139,16 @@ void prepare_ack_packet(prepared_packet* packet, int32_t seq, int32_t ack_seq,
   tcph->ack_seq = htonl(static_cast<uint32_t>(ack_seq));
   tcph->check = 0;
 
+  // memcpy(packet_pseudo_tcp_segment(packet), tcph, OUTGOING_TCP_HEADER_LEN);
   pseudo_tcph->seq = tcph->seq;
   pseudo_tcph->ack_seq = tcph->ack_seq;
   pseudo_tcph->check = 0;
   tcph->check = checksum(packet->pseudogram.data(),
                          sizeof(pseudo_header) + OUTGOING_TCP_HEADER_LEN);
   pseudo_tcph->check = tcph->check;
+
+  // iph->check = 0;
+  // iph->check = checksum(packet->datagram.data(), iph->tot_len);
 
   *out_packet_len = iph->tot_len;
 }
@@ -176,6 +181,7 @@ bool prepare_data_packet(prepared_packet* packet, int32_t seq, int32_t ack_seq,
   tcph->check =
       checksum(packet->pseudogram.data(),
                sizeof(pseudo_header) + OUTGOING_TCP_HEADER_LEN + data_len);
+  // iph->check = checksum(packet->datagram.data(), iph->tot_len);
   iph->check = checksum(packet->datagram.data(), IPV4_HEADER_LEN);
 
   *out_packet_len = iph->tot_len;
@@ -202,7 +208,12 @@ int read_incoming_payload_length(const char* packet, int received) {
   memcpy(&total_length, packet + 2, sizeof(total_length));
 
   const int payload_length = ntohs(total_length) - INCOMING_PACKET_HEADER_LEN;
-
+  // if (payload_length < 0) {
+  //   return -1;
+  // }
+  // if (payload_length > received - INCOMING_PACKET_HEADER_LEN) {
+  //   return -1;
+  // }
   return payload_length;
 }
 
@@ -283,10 +294,28 @@ void read_seq_and_ack(const char* packet, uint32_t* seq, uint32_t* ack) {
 }
 
 
+// проверить, что не приходит ничего кроме нашего
 int receive_from(int sock, char* buffer, size_t buffer_length,
                  const sockaddr_in* dst) {
   (void)dst;
 
+  // Старый вариант: получали все TCP-пакеты в userspace и вручную
+  // крутили цикл, пока не найдём пакет на наш локальный порт.
+  // unsigned short dst_port = 0;
+  // int received = 0;
+  // do {
+  //   received = recvfrom(sock, buffer, buffer_length, 0, nullptr, nullptr);
+  //   if (received < 0) {
+  //     break;
+  //   }
+  //   memcpy(&dst_port, buffer + 22, sizeof(dst_port));
+  //   if (dst_port != dst->sin_port) {
+  //     std::cout << "received packet from another port (receive_from)" << std::endl;
+  //   }
+  // } while (dst_port != dst->sin_port);
+  // return received;
+
+  // Новый вариант: лишние пакеты уже отфильтрованы BPF в ядре.
   return recvfrom(sock, buffer, buffer_length, 0, nullptr, nullptr);
 }
 
@@ -298,6 +327,7 @@ auto get_current_time_mcs() {
   return mcs;
 }
 
+// обязательно после снятия временной метки
 uint64_t read_message_id(const char* message, int payload_length) {
   uint64_t res_id = 0;
   for (int i = 0; i < payload_length; ++i) {
@@ -309,6 +339,8 @@ uint64_t read_message_id(const char* message, int payload_length) {
   return res_id;
 }
 
+// Навешиваем classic BPF на raw socket, чтобы ядро пропускало только нужный
+// входящий TCP-трафик для нашей пары адресов и портов.
 bool attach_incoming_socket_filter(int sock, const sockaddr_in* local_addr,
                                    const sockaddr_in* remote_addr) {
   const uint32_t remote_ip = ntohl(remote_addr->sin_addr.s_addr);
@@ -316,18 +348,37 @@ bool attach_incoming_socket_filter(int sock, const sockaddr_in* local_addr,
   const uint16_t remote_port = ntohs(remote_addr->sin_port);
   const uint16_t local_port = ntohs(local_addr->sin_port);
 
+  // Смещения внутри IPv4-пакета без опций:
+  // 9  -> protocol
+  // 12 -> source IPv4
+  // 16 -> destination IPv4
+  // 20 -> TCP source port
+  // 22 -> TCP destination port
   sock_filter filter_code[] = {
+      // Оставляем только TCP.
       BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 9),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_TCP, 0, 9),
+
+      // Проверяем, что пакет пришёл от нужного удалённого IPv4.
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, remote_ip, 0, 7),
+
+      // Проверяем, что пакет адресован нашему локальному IPv4.
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, local_ip, 0, 5),
+
+      // Проверяем удалённый TCP source port.
       BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 20),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, remote_port, 0, 3),
+
+      // Проверяем наш локальный TCP destination port.
       BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 22),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, local_port, 0, 1),
+
+      // Пакет подходит под фильтр: отдаём его сокету.
       BPF_STMT(BPF_RET | BPF_K, 0xFFFFFFFFu),
+
+      // Пакет не подходит: отбрасываем в ядре.
       BPF_STMT(BPF_RET | BPF_K, 0),
   };
 
@@ -340,7 +391,14 @@ bool attach_incoming_socket_filter(int sock, const sockaddr_in* local_addr,
                     sizeof(filter_program)) == 0;
 }
 
+
+// inline функции, лучше оформить код без вызовов функций
+// можно попробовать [[always_inline]] прописать все функции в main
+// то есть вообще без вызовов функций
 int main(int argc, char** argv) {
+  // Старый вариант: сохраняли пару {echoed timestamp, время получения}.
+  // std::vector<std::pair<uint64_t, uint64_t>> timestamps;
+  // timestamps.reserve(5000);
   std::vector<uint64_t> deltas;
   deltas.reserve(MESSAGE_COUNT);
 
@@ -352,8 +410,8 @@ int main(int argc, char** argv) {
 
   std::srand(static_cast<unsigned>(std::time(nullptr)));
 
-  std::string source_ip = "172.20.10.2";
-  std::string target_ip = "172.20.10.3";
+  std::string source_ip = "192.168.3.13";
+  std::string target_ip = "192.168.3.2";
   int target_port = 3333;
   if (argc >= 2) {
     source_ip = argv[1];
@@ -406,6 +464,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // Новый вариант: ядро само отбросит весь TCP-трафик, который не относится
+  // к нашей паре {remote ip:port -> local ip:port}.
   if (!attach_incoming_socket_filter(sock, &saddr, &daddr)) {
     std::cerr << "setsockopt(SO_ATTACH_FILTER) failed\n";
     close(sock);
@@ -465,6 +525,38 @@ int main(int argc, char** argv) {
   std::cout << "Handshake complete\n";
 
   // ------ DUPLEX LOOP ------
+
+  // Старый вариант: клиент только принимал поток сообщений от сервера.
+  // std::cout << "start_receiving" << std::endl;
+  // uint32_t seq_number = 0;
+  // uint32_t ack_number = 0;
+  // int payload_length;
+  // uint64_t cur_time;
+  // const char* payload;
+  // while (true) {
+  //   received = receive_from(sock, recvbuf, sizeof(recvbuf), &saddr);
+  //   if (received <= 0) [[unlikely]] {
+  //     break;
+  //   }
+  //   cur_time = std::chrono::duration_cast<std::chrono::microseconds>(
+  //       std::chrono::steady_clock::now().time_since_epoch()
+  //   ).count();
+  //   payload = recvbuf + INCOMING_PAYLOAD_OFFSET;
+  //   payload_length = read_incoming_payload_length(recvbuf, received);
+  //   timestamps.emplace_back(read_message_id(payload, payload_length), cur_time);
+  //   read_seq_and_ack(recvbuf, &seq_number, &ack_number);
+  //   ack_to_server = seq_number + payload_length;
+  //   prepare_ack_packet(&ack_packet, client_seq, ack_to_server, &packet_len);
+  //   sent = sendto(sock, ack_packet.datagram.data(), packet_len, 0,
+  //                 reinterpret_cast<sockaddr*>(&daddr), sizeof(sockaddr));
+  //   if (static_cast<unsigned char>(recvbuf[INCOMING_FLAGS_OFFSET]) & 0x01) [[unlikely]] {
+  //     std::cout << "Received FIN, closing connection" << std::endl;
+  //     break;
+  //   }
+  //   if (sent <= 0) [[unlikely]] {
+  //     break;
+  //   }
+  // }
 
   std::cout << "start_duplex" << std::endl;
 
@@ -548,8 +640,12 @@ int main(int argc, char** argv) {
     }
   }
 
-  std::ofstream fout("recv_single_raw.txt");
+  std::ofstream fout("recv_duo_raw.txt");
 
+  // Старый вариант: писали пару {echoed timestamp, время получения}.
+  // for (const auto [first_time, second_time] : timestamps) {
+  //   fout << first_time << ' ' << second_time << '\n';
+  // }
   for (const uint64_t delta : deltas) {
     fout << delta << '\n';
   }

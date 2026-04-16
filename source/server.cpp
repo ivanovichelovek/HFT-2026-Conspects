@@ -27,6 +27,9 @@ std::string read_data_until(boost::asio::ip::tcp::socket& socket) {
 
   std::string message;
 
+  // Because buffer 'buf' may contain some other data
+  // after '\n' symbol, we have to parse the buffer and
+  // extract only symbols before the delimiter.
   std::istream input_stream(&buffer);
   std::getline(input_stream, message, '!');
 
@@ -76,11 +79,21 @@ int main(int argc, char** argv)
 
     // ---------- duplex echo ----------
 
+    // Старый вариант: сервер сам генерировал сообщения и отправлял их клиенту.
+    // for (int i = 0; i < 1000; ++i) {
+    //   uint64_t send_time = get_current_time_mcs();
+    //   send_data(socket, std::to_string(send_time) + '!');
+    //
+    //   std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // }
+
+    // Новый вариант: сервер только возвращает клиенту его же сообщение.
     while (true) {
       std::string message = read_data_until(socket);
       send_data(socket, message + '!');
     }
 
+    // fout.close();
   } catch (boost::system::system_error& e) {
     std::cout << "Error occured! Error code = " << e.code()
               << ". Message: " << e.what() << std::endl;
